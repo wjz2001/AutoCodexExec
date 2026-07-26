@@ -20,6 +20,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
+# 强制将标准输出和标准错误输出改为 UTF-8
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding.lower() != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
+
+
 class Colors:
     CYAN = "\033[96m"
     YELLOW = "\033[93m"
@@ -156,6 +163,7 @@ class ProcessResult:
     timeout_reason: Optional[str]
     duration_seconds: float
     log_file: Path
+    output_tail: str
 
 
 def now_iso() -> str:
@@ -470,15 +478,36 @@ def authorization_context_digest() -> str:
     return digest.hexdigest()
 
 
-def project_rules_require_authorization() -> bool:
+def display_project_path(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(SCRIPT_DIR.resolve()).as_posix()
+    except ValueError:
+        return str(path.resolve())
+
+
+def authorization_rule_matches() -> Tuple[str, ...]:
+    matches: List[str] = []
     for path in authorization_rule_files():
+        display_path = display_project_path(path)
         try:
             content = path.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
-            return True
-        if any(pattern.search(content) for pattern in AUTHORIZATION_RULE_PATTERNS):
-            return True
-    return False
+            matches.append(f"{display_path}（文件无法读取，按受保护规则处理）")
+            continue
+        for pattern in AUTHORIZATION_RULE_PATTERNS:
+            match = pattern.search(content)
+            if match is None:
+                continue
+            line_number = content.count("\n", 0, match.start()) + 1
+            line = content.splitlines()[line_number - 1].strip()
+            detail = f"{display_path}:{line_number}：{compact_console_text(line, 320)}"
+            if detail not in matches:
+                matches.append(detail)
+    return tuple(matches)
+
+
+def project_rules_require_authorization() -> bool:
+    return bool(authorization_rule_matches())
 
 
 def matching_authorization_scope(task: TaskState) -> Optional[str]:
@@ -510,17 +539,19 @@ def authorization_file_digest() -> Optional[str]:
 
 def create_authorization_request(task: TaskState) -> None:
     request_id = f"REQ-AUTH-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    rule_matches = authorization_rule_matches()
+    rule_summary = "；".join(rule_matches)
     request = {
         "version": 1,
         "request_id": request_id,
         "kind": "human_action",
         "task_id": task.task_id,
-        "reason": "项目规则要求在修改前取得用户明确授权",
-        "targets": ["项目规则明确要求授权的代码或文件", f"当前任务 {task.task_id}", "当前计划及适用项目规则"],
+        "reason": f"项目规则要求在修改前取得用户明确授权。授权依据：{rule_summary}",
+        "targets": [f"当前任务 {task.task_id}：{task.title}", *rule_matches],
         "risk_level": "medium",
         "risk": "授权只允许当前计划必要范围内的工作区代码修改，不扩大沙箱或系统权限",
         "timeout_seconds": 21600,
-        "instructions": "请在当前终端选择仅授权当前任务，或授权当前计划中必要的修改",
+        "instructions": "请核对上方授权依据和涉及位置，再选择仅授权当前任务或授权当前计划中必要的修改",
         "authorization": {
             "area": AUTHORIZATION_AREA,
             "plan_digest": authorization_context_digest(),
@@ -880,6 +911,7 @@ def run_process(
     last_activity_at = started_at
     timeout_reason: Optional[str] = None
     output_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+    output_tail: List[str] = []
     stdin_stream = None
     if stdin_text is not None:
         stdin_stream = tempfile.TemporaryFile(
@@ -923,6 +955,8 @@ def run_process(
                         else:
                             last_activity_at = time.monotonic()
                             log.write(line)
+                            output_tail.append(line.rstrip())
+                            del output_tail[:-20]
                             if render_codex_events:
                                 render_codex_json_line(line)
                             else:
@@ -953,7 +987,14 @@ def run_process(
         finally:
             if stdin_stream is not None:
                 stdin_stream.close()
-    return ProcessResult(return_code, timeout_reason is not None, timeout_reason, duration, log_file)
+    return ProcessResult(
+        return_code,
+        timeout_reason is not None,
+        timeout_reason,
+        duration,
+        log_file,
+        "\n".join(output_tail),
+    )
 
 
 def resolve_codex_executable() -> str:
@@ -963,12 +1004,34 @@ def resolve_codex_executable() -> str:
     return executable
 
 
+def verify_codex_executable(codex_executable: str) -> str:
+    try:
+        result = subprocess.run(
+            [codex_executable, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"Codex CLI 本地自检失败：{error}") from error
+    output = normalized_console_text(result.stdout)
+    if result.returncode != 0:
+        detail = f"：{compact_console_text(output)}" if output else ""
+        raise RuntimeError(f"Codex CLI 本地自检退出码 {result.returncode}{detail}")
+    return output or "版本未知"
+
+
 def build_codex_command(
     codex_executable: str,
     model: str,
     effort: str,
 ) -> List[str]:
-    return [
+    command = [
         codex_executable,
         "--ask-for-approval",
         "never",
@@ -985,6 +1048,19 @@ def build_codex_command(
         "never",
         "-",
     ]
+    return command
+
+
+def deterministic_codex_startup_error(result: ProcessResult) -> Optional[str]:
+    output = normalized_console_text(result.output_tail)
+    normalized_output = output.casefold()
+    if result.return_code not in {126, 127} and "stdin is not a terminal" not in normalized_output:
+        return None
+    detail = command_failure_tail(output)
+    reason = f"Codex CLI 启动失败（退出码 {result.return_code}）"
+    if detail:
+        reason = f"{reason}：{detail}"
+    return reason
 
 
 def architect_prompt(requirements: str) -> str:
@@ -1034,7 +1110,7 @@ def worker_prompt(next_task: TaskState, consecutive_no_progress: int = 0) -> str
 4. 不得修改 {SCRIPT_NAME}。不得主动编辑 .codex-automation 中除 STATE.md 当前任务复选框和第 6 条 PERMISSION_REQUEST.json 之外的文件。构建工具可以使用其中既定的缓存、临时、日志目录。不得绕过沙箱、审批、测试、安全门禁、项目规则。禁止使用 danger-full-access 或任何绕过审批的参数;
 5. 遇到权限拒绝时，先寻找工作区内的安全替代方案，例如把缓存和临时文件重定向到 .codex-automation；
 6. 如果不存在安全替代方案，或者项目规则额外要求取得用户同意，不要重复尝试、不要直接向用户提问、不要把任务标记为完成。必须在 .codex-automation/PERMISSION_REQUEST.json 写入一个 JSON 对象然后结束本轮；
-7. 权限请求格式必须包含：version=1、唯一 request_id（格式 REQ-日期时间-随机串）、kind（command 或 human_action）、task_id、reason、targets 字符串数组、risk_level（low/medium/high）、risk、timeout_seconds。kind=command 时还必须包含 command 字符串数组和 cwd，禁止使用单个 shell 命令字符串；kind=human_action 时必须包含 instructions。需要 Windows 管理员/UAC、系统设置、凭据输入或高成本 API 确认的操作只能使用 human_action，不得尝试 runas、sudo 或类似提权命令；
+7. 权限请求格式必须包含：version=1、唯一 request_id（格式 REQ-日期时间-随机串）、kind（command 或 human_action）、task_id、reason、targets 字符串数组、risk_level（low/medium/high）、risk、timeout_seconds。reason 必须说明权限来源（沙箱、文件系统 ACL、管理员/UAC、项目规则、凭据、高成本 API 或架构决策）和实际拒绝原因；targets 必须逐项填写具体文件、目录、服务、系统资源或 API，禁止使用“相关文件”“必要范围”等笼统描述；risk 必须说明批准后的实际影响。kind=command 时还必须包含 command 字符串数组和 cwd，禁止使用单个 shell 命令字符串；kind=human_action 时必须包含具体可执行的 instructions。需要 Windows 管理员/UAC、系统设置、凭据输入或高成本 API 确认的操作只能使用 human_action，不得尝试 runas、sudo 或类似提权命令；
 8. 如果 .codex-automation/PERMISSION_REQUEST.json 已存在，不得覆盖，直接结束本轮。
 9. 可以读取 .codex-automation/permissions 中最近一次同任务授权结果，并根据结果继续处理。上方授权状态已经明确允许的范围不得再次以“未经同意”为由停止；
 10. 只有实现完成、验收标准满足且所有必要验证通过后，才能把 .codex-automation/STATE.md 中 {next_task.task_id} 从 [ ] 改为 [x]；
@@ -1104,15 +1180,24 @@ def validate_permission_request(value: Dict[str, Any]) -> Dict[str, Any]:
     missing = sorted(required - value.keys())
     if missing:
         raise ValueError(f"权限请求缺少字段：{', '.join(missing)}")
+    if value["version"] != 1:
+        raise ValueError("权限请求 version 必须是 1")
     request_id = value["request_id"]
     if not isinstance(request_id, str) or not REQUEST_ID_PATTERN.fullmatch(request_id):
         raise ValueError("权限请求 request_id 格式无效")
+    for field_name in ("task_id", "reason", "risk"):
+        if not isinstance(value[field_name], str) or not value[field_name].strip():
+            raise ValueError(f"权限请求 {field_name} 必须是非空字符串")
     if value["kind"] not in {"command", "human_action"}:
         raise ValueError("权限请求 kind 只能是 command 或 human_action")
     if value["risk_level"] not in {"low", "medium", "high"}:
         raise ValueError("权限请求 risk_level 只能是 low、medium 或 high")
-    if not isinstance(value["targets"], list) or not all(isinstance(item, str) for item in value["targets"]):
-        raise ValueError("权限请求 targets 必须是字符串数组")
+    if (
+        not isinstance(value["targets"], list)
+        or not value["targets"]
+        or not all(isinstance(item, str) and item.strip() for item in value["targets"])
+    ):
+        raise ValueError("权限请求 targets 必须是非空字符串数组")
     timeout_seconds = value.get("timeout_seconds", 1800)
     if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 21600:
         raise ValueError("权限请求 timeout_seconds 必须在 1 到 21600 之间")
@@ -1150,23 +1235,46 @@ def read_pending_permission() -> Optional[Dict[str, Any]]:
     return validate_permission_request(read_json(PENDING_PERMISSION_FILE))
 
 
+def print_permission_request_details(request: Dict[str, Any]) -> None:
+    authorization = request.get("authorization")
+    if isinstance(authorization, dict):
+        permission_source = "项目规则"
+    elif request["kind"] == "command":
+        permission_source = "沙箱外一次性命令"
+    else:
+        permission_source = "需要人工介入的操作"
+    print_color(f"请求 ID：{request['request_id']}", Colors.CYAN)
+    print_color(f"任务：{request['task_id']}", Colors.CYAN)
+    print_color(f"权限来源：{permission_source}", Colors.CYAN)
+    print_console_block("原因", request["reason"], Colors.CYAN)
+    print_console_block("涉及位置或资源", "\n".join(request["targets"]), Colors.YELLOW)
+    print_console_block(
+        "风险",
+        f"{request['risk_level']}：{request['risk']}",
+        Colors.YELLOW,
+    )
+    if request["kind"] == "command":
+        print_console_block(
+            "受限操作",
+            json.dumps(request["command"], ensure_ascii=False),
+            Colors.YELLOW,
+        )
+        print_color(f"执行目录：{request['cwd']}", Colors.YELLOW)
+    elif isinstance(authorization, dict):
+        print_console_block("需要确认", request["instructions"], Colors.YELLOW)
+    else:
+        print_console_block("人工操作", request["instructions"], Colors.YELLOW)
+
+
 def wait_for_permission_resolution() -> None:
     request = read_pending_permission()
     if request is None:
         return
     request_id = request["request_id"]
     update_run_state(status="WAITING_APPROVAL", permission_request=request)
-    print_color("当前任务因权限不足而暂停，Codex 子进程已退出。", Colors.YELLOW)
-    print_color(f"请求 ID：{request_id}", Colors.CYAN)
-    print_color(f"任务：{request['task_id']}", Colors.CYAN)
-    print_color(f"原因：{request['reason']}", Colors.CYAN)
+    print_color("当前任务需要获取权限或人工确认，Codex 子进程已退出。", Colors.YELLOW)
+    print_permission_request_details(request)
     authorization = request.get("authorization")
-    if request["kind"] == "command":
-        print_color(f"命令：{json.dumps(request['command'], ensure_ascii=False)}", Colors.YELLOW)
-    elif isinstance(authorization, dict):
-        print_color("人工操作：请在当前终端选择当前任务授权或当前计划授权", Colors.YELLOW)
-    else:
-        print_color(f"人工操作：{request['instructions']}", Colors.YELLOW)
     play_permission_alert()
     if sys.stdin.isatty():
         handle_permission_in_current_terminal(request)
@@ -1452,7 +1560,7 @@ def show_status() -> int:
     request = read_pending_permission()
     if request:
         print("\n待处理权限请求：")
-        print(json.dumps(request, ensure_ascii=False, indent=2))
+        print_permission_request_details(request)
     try:
         snapshot = parse_state_file()
         print(f"\n任务进度：{snapshot.completed_count}/{len(snapshot.tasks)}")
@@ -1465,7 +1573,7 @@ def show_status() -> int:
 
 def show_usage_help() -> int:
     help_text = f"""
-{SCRIPT_NAME} 是一个安全、可断点续跑的 Codex 自动化监督脚本。
+{SCRIPT_NAME} 是一个安全、可断点续跑的 Codex 自动化监督脚本。建议先安装 git 再运行。
 
 常用命令
 
@@ -1505,8 +1613,8 @@ def show_usage_help() -> int:
 权限不足与批准的关系
 
   1. Codex 始终运行在 workspace-write 沙箱中，不能自行获取更高权限；
-  2. 某项操作无法在沙箱内完成时，Codex 只负责写入 PERMISSION_REQUEST.json，然后退出；
-  3. 监督脚本停止启动新任务，在当前终端显示选择菜单并等待你的决定，不会自动批准。
+  2. 某项操作无法在沙箱内完成时，Codex 只负责写入 PERMISSION_REQUEST.json，然后退出。请求必须写明权限来源、实际拒绝原因，以及具体文件、目录、服务或系统资源；
+  3. 监督脚本停止启动新任务，在当前终端显示权限来源、原因、涉及位置、执行目录和风险，并等待你的决定，不会自动批准。
      如果已在脚本顶部填写 WAV Base64，此时会播放声音，并每 5 分钟重复提醒一次。Base64 应放在引号内；
   4. 输入 1 可批准当前任务的一次请求；出现计划级授权选项时，输入 2 可批准当前计划内受项目规则保护的修改；输入 D 拒绝请求。
      选择后仍需按屏幕提示输入完整确认文本，防止模型自动代理自我授权。
@@ -1515,7 +1623,7 @@ def show_usage_help() -> int:
 
 授权范围
 
-  脚本依据当前 RULES.md，以及项目目录、子目录和祖先目录中适用的 AGENTS.md，识别明确要求
+  脚本依据当前 RULES.md，以及项目目录、子目录、祖先目录中适用的 AGENTS.md，识别明确要求
   修改前必须人工“同意、批准、授权”的规则。
   对受项目规则保护的修改，选择 1 只授权当前任务，任务完成后不适用于下一任务。
   只有明确选择 2 才授权当前计划内必要的受保护修改，计划级确认需要手动输入 APPROVE PLAN <请求ID>。
@@ -1538,7 +1646,7 @@ def show_usage_help() -> int:
 
 控制台输出
 
-  控制台只显示经过整理的彩色任务摘要、思考、命令结果、错误末尾，不直接输出 Codex JSON。
+  控制台只显示经过整理的彩色任务摘要、思考、命令结果、权限详情、错误末尾，不直接输出 Codex JSON。
   控制台中省略的完整事件、命令输出、诊断信息始终保存在 .codex-automation/logs/。
 
 Git 忽略规则
@@ -1584,10 +1692,12 @@ def state_transition_error(
 def run_automation(arguments: argparse.Namespace) -> int:
     ensure_runtime_directories()
     codex_executable = resolve_codex_executable()
+    codex_version = verify_codex_executable(codex_executable)
     with supervisor_lock():
         prepare_previous_round()
         print_color("启动安全无人值守 Codex 生产线……", Colors.CYAN)
         print_color(f"本次使用模型：{arguments.model}；推理力度：{arguments.effort}", Colors.DARK_GRAY)
+        print_color(f"Codex CLI：{codex_executable}（{codex_version}）", Colors.DARK_GRAY)
         snapshot = ensure_planning_documents(arguments, codex_executable)
         update_run_state(
             status="RUNNING",
@@ -1686,6 +1796,20 @@ def run_automation(arguments: argparse.Namespace) -> int:
                 )
                 time.sleep(2)
                 continue
+            if result is not None:
+                startup_error = deterministic_codex_startup_error(result)
+                if startup_error:
+                    log_path = str(result.log_file.relative_to(SCRIPT_DIR))
+                    reason = f"{startup_error}；日志：{log_path}"
+                    update_run_state(
+                        status="PAUSED_STARTUP_ERROR",
+                        pause_reason=reason,
+                        last_failure=reason,
+                        last_log=log_path,
+                    )
+                    print_color(reason, Colors.RED)
+                    print_color("重试该错误不会恢复，监督脚本已立即暂停。", Colors.YELLOW)
+                    return 6
             if result is not None and result.return_code == 0:
                 consecutive_no_progress += 1
                 consecutive_failures = 0
