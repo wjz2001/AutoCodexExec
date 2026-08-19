@@ -10,19 +10,34 @@ param(
     [int]$MaxAutoResumeAttempts = 5
 )
 
-$utf8Encoding = [System.Text.UTF8Encoding]::new($false)
-[Console]::InputEncoding = $utf8Encoding
-[Console]::OutputEncoding = $utf8Encoding
-$OutputEncoding = $utf8Encoding
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$utf8Encoding = [System.Text.UTF8Encoding]::new($false)
+  [Console]::InputEncoding = $utf8Encoding
+  [Console]::OutputEncoding = $utf8Encoding
+  $OutputEncoding = $utf8Encoding
+
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $rulesPath = Join-Path $projectRoot '.codex-automation\planning\RULES.md'
 $planPath = Join-Path $projectRoot '.codex-automation\planning\PLAN.md'
+$gitReadMaxAttempts = 5
 
-function Invoke-HerdrJson {
+function Get-HerdrErrorCodeFromText {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Text
+    )
+
+    $match = [regex]::Match($Text, '"code"\s*:\s*"(?<code>[^"]+)"')
+    if ($match.Success) {
+        return $match.Groups['code'].Value
+    }
+
+    return $null
+}
+
+function Invoke-HerdrText {
     param(
         [Parameter(Mandatory)]
         [string[]]$Arguments,
@@ -34,21 +49,21 @@ function Invoke-HerdrJson {
     while ($true) {
         $attempt++
         $output = & herdr @Arguments 2>&1
+        $outputText = $output | Out-String
         if ($LASTEXITCODE -eq 0) {
-            return ($output | Out-String | ConvertFrom-Json -Depth 20)
+            return $outputText
         }
 
-        $outputText = $output | Out-String
         if (-not $RetryRead) {
             throw "Herdr 命令失败: herdr $($Arguments -join ' ')`n$outputText"
         }
 
-        $errorCodeMatch = [regex]::Match($outputText, '"code":"(?<code>[^"]+)"')
-        if ($errorCodeMatch.Success) {
-            $errorCode = $errorCodeMatch.Groups['code'].Value
-            if ($errorCode -notmatch '(?i)(timeout|unavailable|connection|transport|network|server|io)') {
-                throw "Herdr 命令失败: herdr $($Arguments -join ' ')`n$outputText"
-            }
+        $errorCode = Get-HerdrErrorCodeFromText -Text $outputText
+        if (
+            [string]::IsNullOrWhiteSpace($errorCode) -or
+            $errorCode -notmatch '(?i)(timeout|unavailable|connection|transport|network|server|io)'
+        ) {
+            throw "Herdr 命令失败: herdr $($Arguments -join ' ')`n$outputText"
         }
 
         $retryDelaySeconds = [Math]::Min(
@@ -60,18 +75,30 @@ function Invoke-HerdrJson {
     }
 }
 
+function Invoke-HerdrJson {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments,
+
+        [switch]$RetryRead
+    )
+
+    $outputText = Invoke-HerdrText -Arguments $Arguments -RetryRead:$RetryRead
+    try {
+        return ($outputText | ConvertFrom-Json -Depth 20)
+    }
+    catch {
+        throw "Herdr 命令未返回有效 JSON: herdr $($Arguments -join ' ')`n$outputText"
+    }
+}
+
 function Get-HerdrErrorCode {
     param(
         [Parameter(Mandatory)]
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    $match = [regex]::Match($ErrorRecord.Exception.Message, '"code":"(?<code>[^"]+)"')
-    if ($match.Success) {
-        return $match.Groups['code'].Value
-    }
-
-    return $null
+    return Get-HerdrErrorCodeFromText -Text $ErrorRecord.Exception.Message
 }
 
 function Get-TaskAgent {
@@ -81,7 +108,12 @@ function Get-TaskAgent {
     )
 
     $agents = Invoke-HerdrJson -Arguments @('agent', 'list') -RetryRead
-    return @($agents.result.agents | Where-Object { $_.name -eq $AgentName }) | Select-Object -First 1
+    return @(
+        $agents.result.agents | Where-Object {
+            $nameProperty = $_.PSObject.Properties['name']
+            $null -ne $nameProperty -and [string]$nameProperty.Value -eq $AgentName
+        }
+    ) | Select-Object -First 1
 }
 
 function Get-AgentPaneId {
@@ -92,13 +124,13 @@ function Get-AgentPaneId {
 
     $paneProperty = $Agent.PSObject.Properties['pane_id']
     if ($null -eq $paneProperty -or [string]::IsNullOrWhiteSpace([string]$paneProperty.Value)) {
-        throw "Herdr 未提供代理 $($Agent.name) 的 pane ID。"
+        throw 'Herdr 未提供代理 pane ID。'
     }
 
     return [string]$paneProperty.Value
 }
 
-function Assert-TaskAgentWorkspace {
+function Assert-TaskAgent {
     param(
         [Parameter(Mandatory)]
         [pscustomobject]$Agent,
@@ -106,6 +138,11 @@ function Assert-TaskAgentWorkspace {
         [Parameter(Mandatory)]
         [string]$AgentName
     )
+
+    $kindProperty = $Agent.PSObject.Properties['agent']
+    if ($null -eq $kindProperty -or [string]$kindProperty.Value -ne 'codex') {
+        throw "同名代理 $AgentName 不是 Codex 代理，拒绝复用。"
+    }
 
     $cwdProperty = $Agent.PSObject.Properties['cwd']
     if ($null -eq $cwdProperty -or [string]::IsNullOrWhiteSpace([string]$cwdProperty.Value)) {
@@ -122,14 +159,22 @@ function Assert-TaskAgentWorkspace {
 function Close-TaskPane {
     param(
         [Parameter(Mandatory)]
-        [string]$PaneId
+        [string]$AgentName
     )
 
+    $agent = Get-TaskAgent -AgentName $AgentName
+    if ($null -eq $agent) {
+        Write-Host "任务已提交，但代理 $AgentName 已退出，无法确认 pane 归属，保留其 pane。" -ForegroundColor Yellow
+        return
+    }
+
+    Assert-TaskAgent -Agent $agent -AgentName $AgentName
+    $paneId = Get-AgentPaneId -Agent $agent
     try {
-        [void](Invoke-HerdrJson -Arguments @('pane', 'close', $PaneId))
+        [void](Invoke-HerdrJson -Arguments @('pane', 'close', $paneId))
     }
     catch {
-        Write-Host "任务已提交，但关闭 pane $PaneId 失败：$($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "任务已提交，但关闭 pane $paneId 失败：$($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
@@ -163,7 +208,7 @@ function Get-TaskCommitSubject {
     $text = @($Task.implementation) + @($Task.acceptance) + @($Task.validation) -join "`n"
     $match = [regex]::Match(
         $text,
-        '(?<subject>(?:feat|fix|refactor|chore|docs|config|style|perf|test|build|ci)(?:\([^)]+\))?:[^，。；\r\n]+?)(?=\s*提交|[，。；\r\n]|$)'
+        '提交消息使用简体中文[：:]\s*(?<subject>[^，。；\r\n]+)'
     )
     if (-not $match.Success) {
         throw "无法从任务 $($Task.id) 提取规定的提交消息。"
@@ -172,22 +217,62 @@ function Get-TaskCommitSubject {
     return $match.Groups['subject'].Value.Trim()
 }
 
-function Get-CommitSubjects {
-    $subjects = & git -C $projectRoot log --format='%s'
-    if ($LASTEXITCODE -ne 0) {
-        throw '无法读取 Git 提交记录。'
-    }
+function Test-GitReadTransientFailure {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
 
-    return @($subjects)
+    return $Text -match '(?i)(cannot be mapped:\s*File too large|cannot allocate memory|not enough memory|paging file is too small|resource temporarily unavailable)'
 }
 
-function Test-TaskCommitted {
+function Invoke-GitRead {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments,
+
+        [switch]$RetryTransient
+    )
+
+    $gitArguments = @('-C', $projectRoot) + $Arguments
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $output = & git @gitArguments 2>&1
+        $exitCode = $LASTEXITCODE
+        $outputText = $output | Out-String
+        if ($exitCode -eq 0) {
+            return @($output)
+        }
+
+        $isTransient = Test-GitReadTransientFailure -Text $outputText
+        if (-not $RetryTransient -or -not $isTransient -or $attempt -ge $gitReadMaxAttempts) {
+            $displayArguments = $gitArguments -join ' '
+            throw "Git 读取命令失败（退出码 $exitCode）：git $displayArguments`n$outputText"
+        }
+
+        $retryDelaySeconds = [Math]::Min(
+            $MaxResumeDelaySeconds,
+            $PollSeconds * [Math]::Pow(2, [Math]::Min($attempt - 1, 10))
+        )
+        Write-Host "Git 读取暂时失败，$retryDelaySeconds 秒后重试；第 $attempt/$gitReadMaxAttempts 次。" -ForegroundColor Yellow
+        Start-Sleep -Seconds ([int]$retryDelaySeconds)
+    }
+}
+
+function Get-CommitSubjects {
+    return @(Invoke-GitRead -Arguments @('log', '--format=%s') -RetryTransient)
+}
+
+function Test-HeadCommitSubject {
     param(
         [Parameter(Mandatory)]
         [string]$CommitSubject
     )
 
-    return $CommitSubject -in (Get-CommitSubjects)
+    $headSubjects = @(Invoke-GitRead -Arguments @('log', '-1', '--format=%s') -RetryTransient)
+    return $headSubjects.Count -eq 1 -and $headSubjects[0] -ceq $CommitSubject
 }
 
 function Get-NextTask {
@@ -196,6 +281,7 @@ function Get-NextTask {
         [pscustomobject]$Plan
     )
 
+    $commitSubjects = @(Get-CommitSubjects)
     $tasksById = @{}
     foreach ($task in $Plan.tasks) {
         if ($tasksById.ContainsKey($task.id)) {
@@ -206,7 +292,7 @@ function Get-NextTask {
 
     foreach ($task in $Plan.tasks) {
         $subject = Get-TaskCommitSubject -Task $task
-        if (Test-TaskCommitted -CommitSubject $subject) {
+        if ($commitSubjects -ccontains $subject) {
             continue
         }
 
@@ -216,7 +302,7 @@ function Get-NextTask {
             }
 
             $dependencySubject = Get-TaskCommitSubject -Task $tasksById[$dependencyId]
-            if (-not (Test-TaskCommitted -CommitSubject $dependencySubject)) {
+            if ($commitSubjects -cnotcontains $dependencySubject) {
                 throw "任务 $($task.id) 的前置任务 $dependencyId 尚未以规定提交完成。"
             }
         }
@@ -247,8 +333,27 @@ SCOPE=allowed_paths_ONLY;PRESERVE_EXISTING_DIRTY;NO_SCOPE_EXPANSION
 VERIFY=ALL_SPECIFIED;NO_SKIP
 COMMIT=STAGE_ALLOWED_PATHS_ONLY;SUBJECT_EXACT:$CommitSubject
 BREAKPOINT=human_action|architecture_ambiguity|permission|requires_out_of_scope;WAIT_IN_PANE;NO_NEXT_TASK
+BREAKPOINT_PROTOCOL=When stopped for a breakpoint, include the dispatcher breakpoint token with value WAIT_FOR_HUMAN on its own line in the final response and do not continue implementation.
 FINAL=commit_hash|validations|git_status_short;STOP
 "@
+}
+
+function Test-AgentBreakpoint {
+    param(
+        [Parameter(Mandatory)]
+        [string]$AgentName
+    )
+
+    $recentOutput = Invoke-HerdrText -Arguments @(
+        'agent'
+        'read'
+        $AgentName
+        '--source'
+        'recent-unwrapped'
+        '--lines'
+        '120'
+    ) -RetryRead
+    return $recentOutput -match 'DISPATCH_BREAKPOINT\s*=\s*WAIT_FOR_HUMAN'
 }
 
 function Wait-ForTaskOutcome {
@@ -264,14 +369,16 @@ function Wait-ForTaskOutcome {
     $lastReportedState = $null
     $settledState = $null
     $settledStateCount = 0
+    $breakpointLatched = $false
     $resumePrompt = @"
 RESUME_UNTIL_COMMIT=$CommitSubject
 IF_NO_BREAKPOINT=IMPLEMENT>VERIFY>STAGE_ALLOWED_ONLY>COMMIT;NO_PLAN_PAUSE
-BREAKPOINT=human_action|architecture_ambiguity|permission|requires_out_of_scope;WAIT_IN_PANE
+BREAKPOINT=human_action|architecture_ambiguity|permission|requires_out_of_scope;WAIT_IN_PANE;NO_NEXT_TASK
+BREAKPOINT_PROTOCOL=When stopped for a breakpoint, include the dispatcher breakpoint token with value WAIT_FOR_HUMAN on its own line in the final response and wait for human input.
 "@
 
     while ($true) {
-        if (Test-TaskCommitted -CommitSubject $CommitSubject) {
+        if (Test-HeadCommitSubject -CommitSubject $CommitSubject) {
             return
         }
 
@@ -283,6 +390,11 @@ BREAKPOINT=human_action|architecture_ambiguity|permission|requires_out_of_scope;
         $state = $agent.agent_status
         switch ($state) {
             'working' {
+                if ($breakpointLatched) {
+                    Write-Host "[$AgentName] 已从人工断点恢复工作，dispatcher 恢复观察。" -ForegroundColor Cyan
+                    $breakpointLatched = $false
+                    $autoResumeAttempts = 0
+                }
                 $lastReportedState = 'working'
                 $settledState = $null
                 $settledStateCount = 0
@@ -328,6 +440,18 @@ BREAKPOINT=human_action|architecture_ambiguity|permission|requires_out_of_scope;
             continue
         }
 
+        if ($breakpointLatched) {
+            Start-Sleep -Seconds $PollSeconds
+            continue
+        }
+
+        if (Test-AgentBreakpoint -AgentName $AgentName) {
+            $breakpointLatched = $true
+            Write-Host "[$AgentName] 已检测到 DISPATCH_BREAKPOINT=WAIT_FOR_HUMAN，暂停自动续推并等待人工批准。" -ForegroundColor Yellow
+            Start-Sleep -Seconds $PollSeconds
+            continue
+        }
+
         if ($autoResumeAttempts -ge $MaxAutoResumeAttempts) {
             Write-Host "[$AgentName] 已达到 $MaxAutoResumeAttempts 次自动续推上限，暂停续推并等待人工操作。" -ForegroundColor Yellow
             Start-Sleep -Seconds $PollSeconds
@@ -369,7 +493,7 @@ function Start-OrReuseTaskAgent {
 
     $existingAgent = Get-TaskAgent -AgentName $AgentName
     if ($null -ne $existingAgent) {
-        Assert-TaskAgentWorkspace -Agent $existingAgent -AgentName $AgentName
+        Assert-TaskAgent -Agent $existingAgent -AgentName $AgentName
         $existingPaneId = Get-AgentPaneId -Agent $existingAgent
         Write-Host "复用现有代理 $AgentName（pane $existingPaneId，状态 $($existingAgent.agent_status)）。" -ForegroundColor Yellow
         return [pscustomobject]@{
@@ -420,9 +544,15 @@ function Start-OrReuseTaskAgent {
         Write-Host "[$AgentName] 首次提示提交时状态发生变化，dispatcher 转入主循环继续观察。" -ForegroundColor Yellow
     }
 
+    $startedAgent = Get-TaskAgent -AgentName $AgentName
+    if ($null -eq $startedAgent) {
+        throw "Herdr 已启动 $AgentName，但代理列表中未返回该代理。"
+    }
+
+    Assert-TaskAgent -Agent $startedAgent -AgentName $AgentName
     return [pscustomobject]@{
-        Agent = Get-TaskAgent -AgentName $AgentName
-        PaneId = $paneId
+        Agent = $startedAgent
+        PaneId = Get-AgentPaneId -Agent $startedAgent
     }
 }
 
@@ -458,10 +588,9 @@ while ($true) {
     Write-Host "准备启动 $($task.id)：$($task.title)" -ForegroundColor Cyan
 
     $prompt = New-TaskPrompt -Task $task -CommitSubject $commitSubject
-    $taskAgent = Start-OrReuseTaskAgent -AgentName $agentName -Prompt $prompt
-    $paneId = $taskAgent.PaneId
+    [void](Start-OrReuseTaskAgent -AgentName $agentName -Prompt $prompt)
 
     Wait-ForTaskOutcome -AgentName $agentName -CommitSubject $commitSubject
     Write-Host "$($task.id) 已检测到规定提交：$commitSubject" -ForegroundColor Green
-    Close-TaskPane -PaneId $paneId
+    Close-TaskPane -AgentName $agentName
 }
