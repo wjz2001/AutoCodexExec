@@ -353,7 +353,7 @@ function Test-AgentBreakpoint {
         '--lines'
         '120'
     ) -RetryRead
-    return $recentOutput -match 'DISPATCH_BREAKPOINT\s*=\s*WAIT_FOR_HUMAN'
+    return $recentOutput -match '(?im)(?:^\s*DISPATCH_BREAKPOINT\s*=\s*WAIT_FOR_HUMAN\s*$|^\s*WAIT_FOR_HUMAN\s*$)'
 }
 
 function Wait-ForTaskOutcome {
